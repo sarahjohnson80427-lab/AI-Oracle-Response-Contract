@@ -1,30 +1,54 @@
 (define-constant err-not-owner (err u100))
-(define-constant err-invalid-fee (err u101))
-(define-constant err-invalid-oracle (err u102))
-(define-constant err-question-not-found (err u103))
-(define-constant err-already-answered (err u104))
-(define-constant err-invalid-signature (err u105))
-(define-constant err-not-open (err u106))
-(define-constant err-expired (err u107))
-(define-constant err-not-asker (err u108))
-(define-constant err-already-refunded (err u109))
+(define-constant err-question-not-found (err u101))
+(define-constant err-already-answered (err u102))
+(define-constant err-invalid-signature (err u103))
+(define-constant err-expired (err u104))
+(define-constant err-not-asker (err u105))
+(define-constant err-already-refunded (err u106))
+(define-constant err-oracle-not-registered (err u107))
+(define-constant err-invalid-bid (err u108))
+(define-constant err-bid-not-found (err u109))
+(define-constant err-not-selected-oracle (err u110))
+(define-constant err-no-bid-selected (err u111))
+(define-constant err-already-registered (err u112))
+(define-constant err-invalid-pubkey (err u113))
+(define-constant err-bounty-question (err u115))
+(define-constant err-no-bounty-or-bid (err u116))
 
 (define-data-var owner principal tx-sender)
-(define-data-var oracle-key (buff 33) 0x00)
-(define-data-var oracle-fee uint u0)
-(define-data-var oracle-active bool false)
 (define-data-var question-nonce uint u0)
 (define-data-var expiry-blocks uint u144)
+(define-data-var bid-nonce uint u0)
+
+(define-map oracle-registry
+  principal
+  {
+    pubkey: (buff 33),
+    registered-at: uint,
+    active: bool,
+  }
+)
 
 (define-map questions
   uint
   {
     asker: principal,
-    bounty: uint,
     question-hash: (buff 32),
     asked-at: uint,
     answered: bool,
-    refunded: bool
+    refunded: bool,
+    selected-bid: (optional uint),
+    bounty-amount: uint,
+  }
+)
+
+(define-map question-bids
+  uint
+  {
+    question-id: uint,
+    oracle: principal,
+    bid-amount: uint,
+    submitted-at: uint,
   }
 )
 
@@ -33,7 +57,7 @@
   {
     responder: principal,
     answer-hash: (buff 32),
-    answered-at: uint
+    answered-at: uint,
   }
 )
 
@@ -41,26 +65,25 @@
   principal
   {
     total-answered: uint,
-    total-earned: uint
+    total-earned: uint,
   }
 )
 
-(define-public (set-oracle (pubkey (buff 33)) (fee uint))
-  (begin
-    (asserts! (is-eq tx-sender (var-get owner)) err-not-owner)
-    (asserts! (> fee u0) err-invalid-fee)
-    (var-set oracle-key pubkey)
-    (var-set oracle-fee fee)
-    (var-set oracle-active true)
-    (ok true)
-  )
-)
-
-(define-public (disable-oracle)
-  (begin
-    (asserts! (is-eq tx-sender (var-get owner)) err-not-owner)
-    (var-set oracle-active false)
-    (ok true)
+(define-public (register-oracle (pubkey (buff 33)))
+  (let (
+      (height stacks-block-height)
+      (existing (map-get? oracle-registry tx-sender))
+    )
+    (begin
+      (asserts! (is-none existing) err-already-registered)
+      (asserts! (not (is-eq pubkey 0x00)) err-invalid-pubkey)
+      (map-set oracle-registry tx-sender {
+        pubkey: pubkey,
+        registered-at: height,
+        active: true,
+      })
+      (ok true)
+    )
   )
 )
 
@@ -73,129 +96,246 @@
 )
 
 (define-public (ask-question (question (buff 256)))
-  (let
-    (
+  (let (
       (qid (+ (var-get question-nonce) u1))
-      (fee (var-get oracle-fee))
       (hash (sha256 question))
       (height stacks-block-height)
     )
     (begin
-      (asserts! (var-get oracle-active) err-not-open)
-      (try! (stx-transfer? fee tx-sender (as-contract tx-sender)))
-      (map-set questions qid
-        {
-          asker: tx-sender,
-          bounty: fee,
-          question-hash: hash,
-          asked-at: height,
-          answered: false,
-          refunded: false
-        }
-      )
+      (map-set questions qid {
+        asker: tx-sender,
+        question-hash: hash,
+        asked-at: height,
+        answered: false,
+        refunded: false,
+        selected-bid: none,
+        bounty-amount: u0,
+      })
       (var-set question-nonce qid)
       (ok qid)
     )
   )
 )
 
-(define-public (submit-answer
-  (qid uint)
-  (answer (buff 256))
-  (signature (buff 65))
+(define-public (ask-bounty-question
+    (question (buff 256))
+    (amount uint)
+  )
+  (let (
+      (qid (+ (var-get question-nonce) u1))
+      (hash (sha256 question))
+      (height stacks-block-height)
+    )
+    (begin
+      (asserts! (> amount u0) err-invalid-bid)
+      (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+      (map-set questions qid {
+        asker: tx-sender,
+        question-hash: hash,
+        asked-at: height,
+        answered: false,
+        refunded: false,
+        selected-bid: none,
+        bounty-amount: amount,
+      })
+      (var-set question-nonce qid)
+      (ok qid)
+    )
+  )
 )
-  (let
-    (
+
+(define-public (submit-bid
+    (qid uint)
+    (bid-amount uint)
+  )
+  (let (
       (q (map-get? questions qid))
-      (ahash (sha256 answer))
-      (pubkey (var-get oracle-key))
+      (oracle-info (map-get? oracle-registry tx-sender))
+      (height stacks-block-height)
+      (new-bid-id (+ (var-get bid-nonce) u1))
+    )
+    (begin
+      (asserts! (is-some q) err-question-not-found)
+      (asserts! (is-some oracle-info) err-oracle-not-registered)
+      (asserts! (get active (unwrap! oracle-info err-oracle-not-registered))
+        err-oracle-not-registered
+      )
+      (asserts! (is-eq (get bounty-amount (unwrap! q err-question-not-found)) u0)
+        err-bounty-question
+      )
+      (asserts! (not (get answered (unwrap! q err-question-not-found)))
+        err-already-answered
+      )
+      (asserts!
+        (< height
+          (+ (get asked-at (unwrap! q err-question-not-found))
+            (var-get expiry-blocks)
+          ))
+        err-expired
+      )
+      (asserts! (> bid-amount u0) err-invalid-bid)
+      (map-set question-bids new-bid-id {
+        question-id: qid,
+        oracle: tx-sender,
+        bid-amount: bid-amount,
+        submitted-at: height,
+      })
+      (var-set bid-nonce new-bid-id)
+      (ok new-bid-id)
+    )
+  )
+)
+
+(define-public (accept-bid
+    (qid uint)
+    (bid-id uint)
+  )
+  (let (
+      (q (map-get? questions qid))
+      (bid (map-get? question-bids bid-id))
       (height stacks-block-height)
     )
     (begin
       (asserts! (is-some q) err-question-not-found)
-      (asserts! (not (get answered (unwrap! q err-question-not-found))) err-already-answered)
+      (asserts! (is-some bid) err-bid-not-found)
+      (asserts! (is-eq tx-sender (get asker (unwrap! q err-question-not-found)))
+        err-not-asker
+      )
+      (asserts! (not (get answered (unwrap! q err-question-not-found)))
+        err-already-answered
+      )
+      (asserts! (is-eq (get question-id (unwrap! bid err-bid-not-found)) qid)
+        err-bid-not-found
+      )
       (asserts!
-        (< height (+ (get asked-at (unwrap! q err-question-not-found)) (var-get expiry-blocks)))
+        (< height
+          (+ (get asked-at (unwrap! q err-question-not-found))
+            (var-get expiry-blocks)
+          ))
         err-expired
       )
-      (asserts!
-        (secp256k1-verify ahash signature pubkey)
-        err-invalid-signature
-      )
-      (map-set answers qid
-        {
-          responder: tx-sender,
-          answer-hash: ahash,
-          answered-at: height
-        }
-      )
-      (map-set questions qid
-        {
-          asker: (get asker (unwrap! q err-question-not-found)),
-          bounty: (get bounty (unwrap! q err-question-not-found)),
-          question-hash: (get question-hash (unwrap! q err-question-not-found)),
-          asked-at: (get asked-at (unwrap! q err-question-not-found)),
-          answered: true,
-          refunded: false
-        }
-      )
-      (let
-        (
-          (stats (default-to { total-answered: u0, total-earned: u0 } (map-get? oracle-stats tx-sender)))
-          (new-count (+ (get total-answered stats) u1))
-          (new-earned (+ (get total-earned stats) (get bounty (unwrap! q err-question-not-found))))
+      (try! (stx-transfer? (get bid-amount (unwrap! bid err-bid-not-found)) tx-sender
+        (as-contract tx-sender)
+      ))
+      (map-set questions qid {
+        asker: (get asker (unwrap! q err-question-not-found)),
+        question-hash: (get question-hash (unwrap! q err-question-not-found)),
+        asked-at: (get asked-at (unwrap! q err-question-not-found)),
+        answered: false,
+        refunded: false,
+        selected-bid: (some bid-id),
+        bounty-amount: (get bounty-amount (unwrap! q err-question-not-found)),
+      })
+      (ok true)
+    )
+  )
+)
+
+(define-public (submit-answer
+    (qid uint)
+    (answer (buff 256))
+    (signature (buff 65))
+  )
+  (let (
+      (q (unwrap! (map-get? questions qid) err-question-not-found))
+      (ahash (sha256 answer))
+      (height stacks-block-height)
+      (selected-bid-id (get selected-bid q))
+      (bounty (get bounty-amount q))
+      (oracle-info (unwrap! (map-get? oracle-registry tx-sender) err-oracle-not-registered))
+      (pubkey (get pubkey oracle-info))
+      (payment-amount (if (is-some selected-bid-id)
+        (let ((bid (unwrap!
+            (map-get? question-bids (unwrap! selected-bid-id err-no-bid-selected))
+            err-bid-not-found
+          )))
+          (asserts! (is-eq tx-sender (get oracle bid)) err-not-selected-oracle)
+          (get bid-amount bid)
         )
-        (map-set oracle-stats tx-sender
-          {
-            total-answered: new-count,
-            total-earned: new-earned
+        (begin
+          (asserts! (> bounty u0) err-no-bounty-or-bid)
+          bounty
+        )
+      ))
+    )
+    (begin
+      (asserts! (get active oracle-info) err-oracle-not-registered)
+      (asserts! (not (get answered q)) err-already-answered)
+      (asserts! (< height (+ (get asked-at q) (var-get expiry-blocks)))
+        err-expired
+      )
+      (asserts! (secp256k1-verify ahash signature pubkey) err-invalid-signature)
+      (map-set answers qid {
+        responder: tx-sender,
+        answer-hash: ahash,
+        answered-at: height,
+      })
+      (map-set questions qid {
+        asker: (get asker q),
+        question-hash: (get question-hash q),
+        asked-at: (get asked-at q),
+        answered: true,
+        refunded: false,
+        selected-bid: selected-bid-id,
+        bounty-amount: bounty,
+      })
+      (let (
+          (stats (default-to {
+            total-answered: u0,
+            total-earned: u0,
           }
+            (map-get? oracle-stats tx-sender)
+          ))
+          (new-count (+ (get total-answered stats) u1))
+          (new-earned (+ (get total-earned stats) payment-amount))
         )
+        (map-set oracle-stats tx-sender {
+          total-answered: new-count,
+          total-earned: new-earned,
+        })
       )
-      (try!
-        (stx-transfer?
-          (get bounty (unwrap! q err-question-not-found))
-          (as-contract tx-sender)
-          tx-sender
-        )
-      )
+      (try! (stx-transfer? payment-amount (as-contract tx-sender) tx-sender))
       (ok true)
     )
   )
 )
 
 (define-public (refund-question (qid uint))
-  (let
-    (
-      (q (map-get? questions qid))
+  (let (
+      (q (unwrap! (map-get? questions qid) err-question-not-found))
       (height stacks-block-height)
+      (selected-bid-id (get selected-bid q))
+      (bounty (get bounty-amount q))
+      (refund-amount (if (is-some selected-bid-id)
+        (let ((bid (unwrap!
+            (map-get? question-bids (unwrap! selected-bid-id err-no-bid-selected))
+            err-bid-not-found
+          )))
+          (get bid-amount bid)
+        )
+        (begin
+          (asserts! (> bounty u0) err-no-bounty-or-bid)
+          bounty
+        )
+      ))
     )
     (begin
-      (asserts! (is-some q) err-question-not-found)
-      (asserts! (is-eq tx-sender (get asker (unwrap! q err-question-not-found))) err-not-asker)
-      (asserts! (not (get answered (unwrap! q err-question-not-found))) err-already-answered)
-      (asserts! (not (get refunded (unwrap! q err-question-not-found))) err-already-refunded)
-      (asserts!
-        (>= height (+ (get asked-at (unwrap! q err-question-not-found)) (var-get expiry-blocks)))
-        err-not-open
+      (asserts! (is-eq tx-sender (get asker q)) err-not-asker)
+      (asserts! (not (get answered q)) err-already-answered)
+      (asserts! (not (get refunded q)) err-already-refunded)
+      (asserts! (>= height (+ (get asked-at q) (var-get expiry-blocks)))
+        err-expired
       )
-      (map-set questions qid
-        {
-          asker: (get asker (unwrap! q err-question-not-found)),
-          bounty: (get bounty (unwrap! q err-question-not-found)),
-          question-hash: (get question-hash (unwrap! q err-question-not-found)),
-          asked-at: (get asked-at (unwrap! q err-question-not-found)),
-          answered: false,
-          refunded: true
-        }
-      )
-      (try!
-        (stx-transfer?
-          (get bounty (unwrap! q err-question-not-found))
-          (as-contract tx-sender)
-          tx-sender
-        )
-      )
+      (map-set questions qid {
+        asker: (get asker q),
+        question-hash: (get question-hash q),
+        asked-at: (get asked-at q),
+        answered: false,
+        refunded: true,
+        selected-bid: selected-bid-id,
+        bounty-amount: bounty,
+      })
+      (try! (stx-transfer? refund-amount (as-contract tx-sender) tx-sender))
       (ok true)
     )
   )
@@ -209,12 +349,12 @@
   (map-get? answers qid)
 )
 
-(define-read-only (get-oracle)
-  {
-    public-key: (var-get oracle-key),
-    fee: (var-get oracle-fee),
-    active: (var-get oracle-active)
-  }
+(define-read-only (get-question-bid (bid-id uint))
+  (map-get? question-bids bid-id)
+)
+
+(define-read-only (get-oracle-info (oracle principal))
+  (map-get? oracle-registry oracle)
 )
 
 (define-read-only (get-oracle-stats (oracle principal))
@@ -223,4 +363,8 @@
 
 (define-read-only (get-question-count)
   (var-get question-nonce)
+)
+
+(define-read-only (get-bid-count)
+  (var-get bid-nonce)
 )
